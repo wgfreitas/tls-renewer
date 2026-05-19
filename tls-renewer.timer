@@ -1,0 +1,13 @@
+[Unit]
+Description=Execução diária do TLS Certificate Auto-Renewer
+
+[Timer]
+# Executa diariamente às 06:00 (horário local do servidor)
+OnCalendar=*-*-* 06:00:00
+# Executa imediatamente se perdeu a janela (ex: servidor desligado)
+Persistent=true
+# Adiciona até 15 min de jitter para evitar thundering herd
+RandomizedDelaySec=900
+
+[Install]
+WantedBy=timers.target

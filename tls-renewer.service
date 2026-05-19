@@ -1,0 +1,21 @@
+[Unit]
+Description=TLS Certificate Auto-Renewer (SINFO/IRR)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/opt/tls-renewer
+ExecStart=/opt/tls-renewer/venv/bin/python3 /opt/tls-renewer/tls_renewer.py
+# Segurança: restringe acesso ao sistema
+ProtectSystem=strict
+ReadWritePaths=/opt/tls-renewer/certs /opt/tls-renewer/chain /var/log/tls-renewer
+ProtectHome=no
+# NOTA: ProtectHome=no necessário porque o venv aponta para pyenv em /root/
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

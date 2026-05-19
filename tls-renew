@@ -1,0 +1,8 @@
+#!/bin/bash
+# Wrapper CLI para tls-renewer
+# Uso:
+#   tls-renew                                   # Execução normal
+#   tls-renew --force                           # Força todos
+#   tls-renew --domain app.example.org  # Apenas 1 domínio
+#   tls-renew --domain app.example.org --force
+/opt/tls-renewer/venv/bin/python3 /opt/tls-renewer/tls_renewer.py "$@"
