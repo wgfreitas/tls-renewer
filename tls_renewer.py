@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-TLS Certificate Auto-Renewer for Fiocruz
+TLS Certificate Auto-Renewer
 =========================================
 Monitora certificados TLS, renova automaticamente via API webhook,
 extrai cadeia (intermediate/root) do PKCS7, e notifica por e-mail.
 
-Autor: Wagner Freitas (SINFO/IRR/Fiocruz)
+Autor: Wagner (YourOrg)
 """
 
 import argparse
+import fcntl
 import json
 import logging
 import os
@@ -21,8 +22,10 @@ from email.mime.text import MIMEText
 from pathlib import Path
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from cryptography import x509
-from cryptography.hazmat.primitives.serialization import Encoding
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from cryptography.hazmat.primitives.serialization import pkcs7 as pkcs7_module
 from cryptography.x509.oid import NameOID
 from dotenv import load_dotenv
@@ -41,21 +44,26 @@ CHAIN_DIR = Path(os.getenv("CHAIN_DIR", "/opt/tls-renewer/chain"))
 LOG_DIR = Path(os.getenv("LOG_DIR", "/var/log/tls-renewer"))
 
 # API
-API_URL = os.getenv("API_URL", "https://tls.fiocruz.br/webhook/certificado")
+API_URL = os.getenv("API_URL", "https://tls.example.org/webhook/certificado")
 API_USER = os.getenv("API_USER")
 API_KEY = os.getenv("API_KEY")
 API_TIMEOUT = int(os.getenv("API_TIMEOUT", "300"))
 API_VERIFY_SSL = os.getenv("API_VERIFY_SSL", "false").lower() == "true"
+API_RETRY_TOTAL = int(os.getenv("API_RETRY_TOTAL", "3"))
+API_RETRY_BACKOFF = float(os.getenv("API_RETRY_BACKOFF", "1"))
+
+# Lock contra execução concorrente (manual × timer)
+LOCK_FILE = Path(os.getenv("LOCK_FILE", "/run/tls-renewer/renewer.lock"))
 
 # Renovação
 RENEW_DAYS_BEFORE = int(os.getenv("RENEW_DAYS_BEFORE", "30"))
 
 # E-mail (SMTP)
-SMTP_HOST = os.getenv("SMTP_HOST", "smtps.fiocruz.br")
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.example.org")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASS = os.getenv("SMTP_PASS", "")
-EMAIL_FROM = os.getenv("EMAIL_FROM", "tls-renewer@minas.fiocruz.br")
+EMAIL_FROM = os.getenv("EMAIL_FROM", "tls-renewer@example.org")
 EMAIL_TO = os.getenv("EMAIL_TO", "")
 
 # Logging
@@ -140,8 +148,66 @@ def cert_needs_renewal(cert_path: Path) -> bool:
     return False
 
 
+def acquire_lock():
+    """
+    Adquire lock exclusivo (flock) para impedir execução concorrente.
+
+    Protege contra corrida entre execução manual (tls-renew) e o timer
+    systemd, que poderia intercalar escritas em chain/ e nos markers.
+
+    O handle retornado deve permanecer aberto durante toda a execução —
+    o flock é liberado automaticamente quando o processo termina, mesmo
+    em caso de crash (kernel-level, sem stale lock).
+    """
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    lock_handle = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log.error(
+            "Outra instância do tls-renewer já está em execução (lock: %s). Abortando.",
+            LOCK_FILE,
+        )
+        sys.exit(1)
+    lock_handle.write(str(os.getpid()))
+    lock_handle.flush()
+    return lock_handle
+
+
+def make_session_with_retries() -> requests.Session:
+    """
+    Cria uma session HTTP com retry automático para falhas transientes.
+
+    Cobre:
+    - Falhas de conexão (connect=N): DNS, TCP reset durante handshake
+    - Falhas de leitura (read=N): connection reset durante transmissão
+    - Respostas 5xx do servidor (status_forcelist)
+
+    Backoff exponencial: API_RETRY_BACKOFF * (2 ** (tentativa - 1)).
+    Com backoff=1: espera 1s, 2s, 4s entre tentativas.
+    """
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=API_RETRY_TOTAL,
+        connect=API_RETRY_TOTAL,
+        read=API_RETRY_TOTAL,
+        backoff_factor=API_RETRY_BACKOFF,
+        status_forcelist=[500, 502, 503, 504],
+        allowed_methods=["POST", "GET"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
 def request_certificate(csr_content: str) -> dict:
-    """Envia CSR para a API e retorna o JSON de resposta."""
+    """
+    Envia CSR para a API e retorna o JSON de resposta.
+    Usa retry automático com backoff exponencial para falhas transientes
+    (connection reset, timeout de conexão, 5xx).
+    """
     headers = {
         "Content-Type": "application/json",
         "X-API-USER": API_USER,
@@ -149,7 +215,8 @@ def request_certificate(csr_content: str) -> dict:
     }
     payload = {"csr": csr_content}
 
-    resp = requests.post(
+    session = make_session_with_retries()
+    resp = session.post(
         API_URL,
         headers=headers,
         json=payload,
@@ -158,6 +225,54 @@ def request_certificate(csr_content: str) -> dict:
     )
     resp.raise_for_status()
     return resp.json()
+
+
+def cert_matches_csr(cert_pem: str, csr_content: str, domain: str) -> tuple[bool, str]:
+    """
+    Valida que o certificado retornado pela API corresponde ao CSR enviado.
+
+    Verificações:
+    1. Public key do certificado == public key do CSR — garante que o cert
+       casa com a chave privada que gerou o CSR. Sem isso, um cert trocado
+       (bug/race na API) seria instalado e derrubaria o serviço com
+       'key values mismatch' no reload.
+    2. CN do certificado == CN do CSR — defesa extra contra troca de pedidos.
+
+    A comparação usa public_bytes em DER (SubjectPublicKeyInfo), uniforme
+    para RSA, EC e Ed25519.
+
+    Retorna: (válido: bool, motivo: str)
+    """
+    try:
+        cert = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
+        csr = x509.load_pem_x509_csr(csr_content.encode("utf-8"))
+    except Exception as exc:
+        return False, f"Falha ao carregar cert/CSR para validação: {exc}"
+
+    cert_pub = cert.public_key().public_bytes(
+        Encoding.DER, PublicFormat.SubjectPublicKeyInfo
+    )
+    csr_pub = csr.public_key().public_bytes(
+        Encoding.DER, PublicFormat.SubjectPublicKeyInfo
+    )
+    if cert_pub != csr_pub:
+        return False, (
+            "Public key do certificado NÃO corresponde à do CSR — "
+            "a API pode ter retornado o certificado de outro pedido. "
+            "Certificado rejeitado (o cert atual permanece em uso)."
+        )
+
+    try:
+        cert_cn = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
+    except (IndexError, ValueError):
+        cert_cn = None
+    if cert_cn and cert_cn != domain:
+        return False, (
+            f"CN do certificado ('{cert_cn}') difere do CN do CSR ('{domain}'). "
+            "Certificado rejeitado."
+        )
+
+    return True, "OK"
 
 
 def save_certificate(domain: str, cert_data: str) -> Path:
@@ -179,7 +294,7 @@ def extract_chain_from_pkcs7(pkcs7_pem: str) -> dict:
     """
     Extrai certificados individuais da cadeia PKCS7 retornada pela API.
 
-    A cadeia PKCS7 da API Fiocruz contém:
+    A cadeia PKCS7 típica retornada pela API contém:
       [0] Certificado do servidor (leaf)
       [1] Certificado intermediário (RNP ICPEdu)
       [2] Certificado raiz (GlobalSign Root R46) — se presente
@@ -335,6 +450,12 @@ def process_csr(csr_path: Path, force: bool = False) -> tuple[bool, str, str]:
             f"Chaves retornadas: {list(response.keys()) if isinstance(response, dict) else 'N/A'}"
         )
 
+    # Valida correspondência cert × CSR antes de salvar (public key + CN)
+    valid, reason = cert_matches_csr(cert_pem, csr_content, domain)
+    if not valid:
+        return False, domain, f"Validação do certificado falhou: {reason}"
+    log.info("  Validação cert × CSR: public key e CN conferem")
+
     # Salva certificado
     saved_path = save_certificate(domain, cert_pem)
 
@@ -429,14 +550,14 @@ def send_notification(renewed: list[dict], errors: list[dict]):
 def main():
     """Ponto de entrada principal."""
     parser = argparse.ArgumentParser(
-        description="TLS Certificate Auto-Renewer — SINFO/IRR/Fiocruz",
+        description="TLS Certificate Auto-Renewer — YourOrg",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Exemplos de uso:
   %(prog)s                                   Execução normal (renova só o que vence)
   %(prog)s --force                           Força renovação de TODOS os CSRs
-  %(prog)s --domain redcap.minas.fiocruz.br  Processa apenas 1 domínio (se vencendo)
-  %(prog)s --domain redcap.minas.fiocruz.br --force   Força renovação de 1 domínio
+  %(prog)s --domain app.example.org  Processa apenas 1 domínio (se vencendo)
+  %(prog)s --domain app.example.org --force   Força renovação de 1 domínio
         """,
     )
     parser.add_argument(
@@ -448,6 +569,10 @@ Exemplos de uso:
         help="Renova apenas o domínio especificado (CN do CSR)",
     )
     args = parser.parse_args()
+
+    # Lock exclusivo — impede execução concorrente (manual × timer).
+    # O handle precisa viver até o fim do processo; flock é liberado no exit.
+    _lock_handle = acquire_lock()  # noqa: F841
 
     log.info("=" * 60)
     log.info("TLS-Renewer iniciado%s", " (FORCE)" if args.force else "")

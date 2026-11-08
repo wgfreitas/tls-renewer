@@ -1,5 +1,5 @@
 [Unit]
-Description=TLS Certificate Auto-Renewer (SINFO/IRR)
+Description=TLS Certificate Auto-Renewer
 After=network-online.target
 Wants=network-online.target
 
@@ -9,13 +9,18 @@ User=root
 Group=root
 WorkingDirectory=/opt/tls-renewer
 ExecStart=/opt/tls-renewer/venv/bin/python3 /opt/tls-renewer/tls_renewer.py
-# Segurança: restringe acesso ao sistema
+# Security hardening: restrict filesystem access
 ProtectSystem=strict
 ReadWritePaths=/opt/tls-renewer/certs /opt/tls-renewer/chain /var/log/tls-renewer
+# NOTE: set ProtectHome=no if your venv points to a Python under /root (e.g. pyenv)
 ProtectHome=no
-# NOTA: ProtectHome=no necessário porque o venv aponta para pyenv em /root/
 NoNewPrivileges=yes
 PrivateTmp=yes
+# Lock file: creates writable /run/tls-renewer (sanctioned exception to strict).
+# Preserve=yes prevents systemd cleanup from deleting the lock of a concurrent
+# manual run (subtle race: flock on a deleted inode does not conflict).
+RuntimeDirectory=tls-renewer
+RuntimeDirectoryPreserve=yes
 
 [Install]
 WantedBy=multi-user.target

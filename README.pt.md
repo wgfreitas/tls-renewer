@@ -14,6 +14,9 @@ Projetado para ambientes onde uma CA central expõe um webhook que aceita CSRs e
 - **Limiar configurável** — renova apenas certificados que vencem em N dias (padrão: 30).
 - **Extração automática da cadeia** — analisa a resposta PKCS7 e salva `intermediate.pem` e `root.pem` separadamente para uso por outros consumidores.
 - **Atualização idempotente da cadeia** — arquivos de cadeia só são sobrescritos quando o conteúdo realmente muda.
+- **Retry automático** — falhas transientes de rede (connection reset, 5xx) são repetidas com backoff exponencial.
+- **Validação certificado ↔ CSR** — o certificado retornado é rejeitado se a public key e o CN não corresponderem ao CSR, impedindo que um certificado trocado chegue aos seus servidores.
+- **Lock de concorrência** — lock via `flock` impede sobreposição entre execução manual e timer.
 - **Notificações por e-mail** — relatório HTML após cada execução.
 - **Flags de CLI** — `--force` e `--domain` para operações manuais.
 - **Execução agendada** — service e timer systemd incluídos.
@@ -120,6 +123,9 @@ sudo systemctl enable --now tls-renewer.timer            # Habilita execução d
 | `API_KEY` | Header `X-API-KEY` | *obrigatório* |
 | `API_TIMEOUT` | Timeout HTTP (segundos) | `300` |
 | `API_VERIFY_SSL` | Validar cadeia TLS do servidor da API | `true` |
+| `API_RETRY_TOTAL` | Tentativas em falhas transientes (reset, 5xx) | `3` |
+| `API_RETRY_BACKOFF` | Fator de backoff exponencial (1 = 1s, 2s, 4s) | `1` |
+| `LOCK_FILE` | Lock contra execução concorrente | `/run/tls-renewer/renewer.lock` |
 | `RENEW_DAYS_BEFORE` | Dias antes do vencimento para renovar | `30` |
 | `SMTP_HOST` / `PORT` / `USER` / `PASS` | SMTP para notificações | — |
 | `EMAIL_FROM` / `EMAIL_TO` | Remetente / destinatários (separados por vírgula) | — |

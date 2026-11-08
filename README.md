@@ -14,6 +14,9 @@ Designed for environments where a central CA exposes a webhook accepting CSRs an
 - **Configurable threshold** — renew only certificates expiring within N days (default: 30).
 - **Automatic chain extraction** — parses the PKCS7 response and saves `intermediate.pem` and `root.pem` separately for downstream consumers.
 - **Idempotent chain updates** — chain files are only overwritten when their content actually changes.
+- **Automatic retry** — transient network failures (connection reset, 5xx) are retried with exponential backoff.
+- **Certificate ↔ CSR validation** — the returned certificate is rejected unless its public key and CN match the CSR, preventing a swapped certificate from ever reaching your servers.
+- **Concurrency lock** — `flock`-based lock prevents manual and timer runs from overlapping.
 - **Email notifications** — HTML summary report after each run.
 - **CLI flags** — `--force` and `--domain` for manual operations.
 - **Scheduled execution** — systemd service and timer included.
@@ -120,6 +123,9 @@ sudo systemctl enable --now tls-renewer.timer
 | `API_KEY` | Header `X-API-KEY` | *required* |
 | `API_TIMEOUT` | HTTP timeout (seconds) | `300` |
 | `API_VERIFY_SSL` | Validate API server TLS chain | `true` |
+| `API_RETRY_TOTAL` | Retries on transient failures (reset, 5xx) | `3` |
+| `API_RETRY_BACKOFF` | Exponential backoff factor (1 = 1s, 2s, 4s) | `1` |
+| `LOCK_FILE` | Lock preventing concurrent runs | `/run/tls-renewer/renewer.lock` |
 | `RENEW_DAYS_BEFORE` | Days before expiry to renew | `30` |
 | `SMTP_HOST` / `PORT` / `USER` / `PASS` | SMTP for notifications | — |
 | `EMAIL_FROM` / `EMAIL_TO` | Sender / recipients (comma-separated) | — |
